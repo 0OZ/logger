@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/0Oz/go-logger"
+	"github.com/0Oz/logger"
 )
 
 func main() {
