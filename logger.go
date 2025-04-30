@@ -16,6 +16,7 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // LogLevel represents logging levels
@@ -76,6 +77,7 @@ type Config struct {
 }
 
 // Logger wraps zap logger with additional functionality
+// Logger provides structured, leveled logging with context, redaction, and output configuration.
 type Logger struct {
 	*zap.SugaredLogger
 	config Config
@@ -217,6 +219,7 @@ func configureEncoder(encoderConfig *zapcore.EncoderConfig, format OutputFormat)
 	}
 }
 
+// configureOutput sets up the log output destination, supporting stdout, stderr, and rolling file logs.
 func configureOutput(outputPath string) zapcore.WriteSyncer {
 	switch strings.ToLower(outputPath) {
 	case "stdout":
@@ -228,13 +231,15 @@ func configureOutput(outputPath string) zapcore.WriteSyncer {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create log directory %s: %v\n", dir, err)
 		}
-
-		file, err := os.OpenFile(outputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to open log file %s: %v\n", outputPath, err)
-			return zapcore.AddSync(os.Stderr)
+		// Use lumberjack for rolling logs
+		ljLogger := &lumberjack.Logger{
+			Filename:   outputPath,
+			MaxSize:    100, // megabytes
+			MaxBackups: 7,
+			MaxAge:     30,   // days
+			Compress:   true, // compress old logs
 		}
-		return zapcore.AddSync(file)
+		return zapcore.AddSync(ljLogger)
 	}
 }
 
@@ -455,16 +460,22 @@ func (l *Logger) GetLevel() LogLevel {
 	}
 }
 
-// Log methods
+// Debug logs a debug message with optional key-value pairs
 func (l *Logger) Debug(msg string, keysAndValues ...interface{}) {
 	l.SugaredLogger.Debugw(msg, keysAndValues...)
 }
+
+// Info logs an info message with optional key-value pairs
 func (l *Logger) Info(msg string, keysAndValues ...interface{}) {
 	l.SugaredLogger.Infow(msg, keysAndValues...)
 }
+
+// Warn logs a warning message with optional key-value pairs
 func (l *Logger) Warn(msg string, keysAndValues ...interface{}) {
 	l.SugaredLogger.Warnw(msg, keysAndValues...)
 }
+
+// Error logs an error message with optional key-value pairs
 func (l *Logger) Error(msg string, keysAndValues ...interface{}) {
 	l.SugaredLogger.Errorw(msg, keysAndValues...)
 }
@@ -563,12 +574,22 @@ func (l *Logger) GetZapLogger() *zap.Logger {
 	return l.SugaredLogger.Desugar()
 }
 
-// Format-style logging methods
+// Debugf logs a formatted debug message
 func (l *Logger) Debugf(format string, args ...interface{}) { l.SugaredLogger.Debugf(format, args...) }
-func (l *Logger) Infof(format string, args ...interface{})  { l.SugaredLogger.Infof(format, args...) }
-func (l *Logger) Warnf(format string, args ...interface{})  { l.SugaredLogger.Warnf(format, args...) }
+
+// Infof logs a formatted info message
+func (l *Logger) Infof(format string, args ...interface{}) { l.SugaredLogger.Infof(format, args...) }
+
+// Warnf logs a formatted warning message
+func (l *Logger) Warnf(format string, args ...interface{}) { l.SugaredLogger.Warnf(format, args...) }
+
+// Errorf logs a formatted error message
 func (l *Logger) Errorf(format string, args ...interface{}) { l.SugaredLogger.Errorf(format, args...) }
+
+// Fatalf logs a formatted fatal message and exits
 func (l *Logger) Fatalf(format string, args ...interface{}) { l.SugaredLogger.Fatalf(format, args...) }
+
+// Panicf logs a formatted panic message and panics
 func (l *Logger) Panicf(format string, args ...interface{}) { l.SugaredLogger.Panicf(format, args...) }
 
 // Sync flushes any buffered log entries
@@ -609,15 +630,10 @@ func NewFileLogger(filePath string, level LogLevel) (*Logger, error) {
 	return NewWithConfig(config), nil
 }
 
-// NewRollingFileLogger creates a logger with file rotation capabilities
+// NewRollingFileLogger creates a logger with file rotation capabilities using lumberjack
 func NewRollingFileLogger(filePath string, level LogLevel) (*Logger, error) {
-	logger, err := NewFileLogger(filePath, level)
-	if err != nil {
-		return nil, err
-	}
-
-	logger.Warn("Rolling file capabilities not implemented - using standard file logger")
-	return logger, nil
+	// Rotation is handled automatically in configureOutput
+	return NewFileLogger(filePath, level)
 }
 
 // ShutdownSignalHandler registers signal handlers to flush logs before shutdown
