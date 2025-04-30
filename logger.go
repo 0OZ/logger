@@ -139,7 +139,6 @@ func NewWithConfig(config Config) *Logger {
 	level := getZapLevel(config.Level)
 	atomicLevel := zap.NewAtomicLevelAt(level)
 
-	// Configure encoder
 	encoderConfig := zapcore.EncoderConfig{
 		TimeKey:        "timestamp",
 		LevelKey:       "level",
@@ -155,32 +154,51 @@ func NewWithConfig(config Config) *Logger {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 
-	// Customize encoder based on format
-	switch config.Format {
+	configureEncoder(&encoderConfig, config.Format)
+	output := configureOutput(config.Output)
+	encoder := createEncoder(encoderConfig, config.Format)
+	core := createCore(encoder, output, atomicLevel, config)
+
+	opts := createZapOptions(config)
+	initialFields := createInitialFields(config)
+	zapLogger := zap.New(core, opts...)
+
+	zapFields := make([]zap.Field, 0, len(initialFields))
+	for k, v := range initialFields {
+		zapFields = append(zapFields, zap.Any(k, v))
+	}
+	sugar := zapLogger.With(zapFields...).Sugar()
+
+	return &Logger{
+		SugaredLogger: sugar,
+		config:        config,
+		fields:        initialFields,
+		level:         atomicLevel,
+	}
+}
+
+func configureEncoder(encoderConfig *zapcore.EncoderConfig, format OutputFormat) {
+	switch format {
 	case FormatConsole:
 		encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 		encoderConfig.EncodeCaller = func(caller zapcore.EntryCaller, enc zapcore.PrimitiveArrayEncoder) {
-			// Get short file path
 			_, file := filepath.Split(caller.File)
 			enc.AppendString(fmt.Sprintf("%s:%d", file, caller.Line))
 		}
 	case FormatPretty:
 		encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 		encoderConfig.EncodeCaller = func(caller zapcore.EntryCaller, enc zapcore.PrimitiveArrayEncoder) {
-			// Get short file path with parent directory for better context
 			dir, file := filepath.Split(caller.File)
 			parentDir := filepath.Base(dir)
 			enc.AppendString(fmt.Sprintf("%s/%s:%d", parentDir, file, caller.Line))
 		}
 		encoderConfig.ConsoleSeparator = " | "
 	case FormatCompact:
-		// Minimal format with just essentials
-		encoderConfig.TimeKey = "" // Skip time to keep it short
+		encoderConfig.TimeKey = ""
 		encoderConfig.LevelKey = "l"
 		encoderConfig.MessageKey = "m"
 		encoderConfig.CallerKey = "c"
 		encoderConfig.EncodeLevel = func(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
-			// Single letter level indicators
 			switch l {
 			case zapcore.DebugLevel:
 				enc.AppendString("D")
@@ -197,56 +215,53 @@ func NewWithConfig(config Config) *Logger {
 			}
 		}
 	}
+}
 
-	// Configure output
-	var output zapcore.WriteSyncer
-	switch strings.ToLower(config.Output) {
+func configureOutput(outputPath string) zapcore.WriteSyncer {
+	switch strings.ToLower(outputPath) {
 	case "stdout":
-		output = zapcore.AddSync(os.Stdout)
+		return zapcore.AddSync(os.Stdout)
 	case "stderr":
-		output = zapcore.AddSync(os.Stderr)
+		return zapcore.AddSync(os.Stderr)
 	default:
-		// Create directory if needed
-		dir := filepath.Dir(config.Output)
+		dir := filepath.Dir(outputPath)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create log directory %s: %v\n", dir, err)
 		}
 
-		// Assume it's a file path
-		file, err := os.OpenFile(config.Output, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		file, err := os.OpenFile(outputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to open log file %s: %v\n", config.Output, err)
-			output = zapcore.AddSync(os.Stderr)
-		} else {
-			output = zapcore.AddSync(file)
+			fmt.Fprintf(os.Stderr, "Failed to open log file %s: %v\n", outputPath, err)
+			return zapcore.AddSync(os.Stderr)
 		}
+		return zapcore.AddSync(file)
 	}
+}
 
-	// Configure encoder format
-	var encoder zapcore.Encoder
-	switch config.Format {
+func createEncoder(encoderConfig zapcore.EncoderConfig, format OutputFormat) zapcore.Encoder {
+	switch format {
 	case FormatJSON:
-		encoder = zapcore.NewJSONEncoder(encoderConfig)
+		return zapcore.NewJSONEncoder(encoderConfig)
 	case FormatConsole, FormatPretty, FormatCompact:
-		encoder = zapcore.NewConsoleEncoder(encoderConfig)
+		return zapcore.NewConsoleEncoder(encoderConfig)
 	default:
-		encoder = zapcore.NewJSONEncoder(encoderConfig)
+		return zapcore.NewJSONEncoder(encoderConfig)
 	}
+}
 
-	// Configure sampling if enabled
-	var core zapcore.Core
+func createCore(encoder zapcore.Encoder, output zapcore.WriteSyncer, level zap.AtomicLevel, config Config) zapcore.Core {
 	if config.SamplingEnabled {
-		core = zapcore.NewSamplerWithOptions(
-			zapcore.NewCore(encoder, output, atomicLevel),
+		return zapcore.NewSamplerWithOptions(
+			zapcore.NewCore(encoder, output, level),
 			time.Second,
 			config.SamplingInitial,
 			config.SamplingThereafter,
 		)
-	} else {
-		core = zapcore.NewCore(encoder, output, atomicLevel)
 	}
+	return zapcore.NewCore(encoder, output, level)
+}
 
-	// Add options
+func createZapOptions(config Config) []zap.Option {
 	opts := []zap.Option{}
 	if config.AddCallerInfo {
 		opts = append(opts, zap.AddCaller())
@@ -260,42 +275,28 @@ func NewWithConfig(config Config) *Logger {
 	if config.StackTrace {
 		opts = append(opts, zap.AddStacktrace(zapcore.ErrorLevel))
 	}
+	return opts
+}
 
-	// Create logger with initial fields
-	initialFields := map[string]interface{}{
+func createInitialFields(config Config) map[string]interface{} {
+	fields := map[string]interface{}{
 		"service": config.ServiceName,
 	}
 
 	if config.Environment != "" {
-		initialFields["env"] = config.Environment
+		fields["env"] = config.Environment
 	}
 
 	if config.Version != "" {
-		initialFields["version"] = config.Version
+		fields["version"] = config.Version
 	}
 
-	// Add hostname for better identification
 	hostname, err := os.Hostname()
 	if err == nil && hostname != "" {
-		initialFields["host"] = hostname
+		fields["host"] = hostname
 	}
 
-	// Create logger
-	zapLogger := zap.New(core, opts...)
-
-	// Add initial fields directly
-	zapFields := make([]zap.Field, 0, len(initialFields))
-	for k, v := range initialFields {
-		zapFields = append(zapFields, zap.Any(k, v))
-	}
-	sugar := zapLogger.With(zapFields...).Sugar()
-
-	return &Logger{
-		SugaredLogger: sugar,
-		config:        config,
-		fields:        initialFields,
-		level:         atomicLevel,
-	}
+	return fields
 }
 
 // fieldsToArgs converts a fields map to a slice of alternating keys and values
@@ -329,7 +330,6 @@ func getZapLevel(level LogLevel) zapcore.Level {
 
 // WithField returns a logger with a field added to it
 func (l *Logger) WithField(key string, value interface{}) *Logger {
-	// Check if this is a field that should be redacted
 	if l.shouldRedact(key) {
 		value = "[REDACTED]"
 	}
@@ -362,13 +362,10 @@ func (l *Logger) shouldRedact(key string) bool {
 // WithFields returns a logger with multiple fields added to it
 func (l *Logger) WithFields(fields map[string]interface{}) *Logger {
 	newFields := make(map[string]interface{}, len(l.fields)+len(fields))
-
-	// Copy existing fields
 	for k, v := range l.fields {
 		newFields[k] = v
 	}
 
-	// Process and add new fields
 	processedFields := make(map[string]interface{}, len(fields))
 	for k, v := range fields {
 		if l.shouldRedact(k) {
@@ -393,13 +390,10 @@ func (l *Logger) WithError(err error) *Logger {
 		return l
 	}
 
-	// Create fields from error
 	errorFields := map[string]interface{}{
-		"error": err.Error(),
+		"error":      err.Error(),
+		"error_type": fmt.Sprintf("%T", err),
 	}
-
-	// Add error type for better classification
-	errorFields["error_type"] = fmt.Sprintf("%T", err)
 
 	return l.WithFields(errorFields)
 }
@@ -411,13 +405,11 @@ func (l *Logger) WithContext() *Logger {
 		return l
 	}
 
-	// Add caller info as fields for consistent inclusion
 	fields := map[string]interface{}{
 		"file": file,
 		"line": line,
 	}
 
-	// Get package and function name
 	if pc, _, _, ok := runtime.Caller(1); ok {
 		if fn := runtime.FuncForPC(pc); fn != nil {
 			fullName := fn.Name()
@@ -463,27 +455,21 @@ func (l *Logger) GetLevel() LogLevel {
 	}
 }
 
-// Debug logs a debug message with optional key-value pairs
+// Log methods
 func (l *Logger) Debug(msg string, keysAndValues ...interface{}) {
 	l.SugaredLogger.Debugw(msg, keysAndValues...)
 }
-
-// Info logs an info message with optional key-value pairs
 func (l *Logger) Info(msg string, keysAndValues ...interface{}) {
 	l.SugaredLogger.Infow(msg, keysAndValues...)
 }
-
-// Warn logs a warning message with optional key-value pairs
 func (l *Logger) Warn(msg string, keysAndValues ...interface{}) {
 	l.SugaredLogger.Warnw(msg, keysAndValues...)
 }
-
-// Error logs an error message with optional key-value pairs
 func (l *Logger) Error(msg string, keysAndValues ...interface{}) {
 	l.SugaredLogger.Errorw(msg, keysAndValues...)
 }
 
-// Fatal logs a fatal message with optional key-value pairs and then exits
+// Fatal logs a fatal message with optional error and then exits
 func (l *Logger) Fatal(msg string, err error) {
 	if err != nil {
 		l.SugaredLogger.Fatalw(msg, "error", err)
@@ -499,7 +485,6 @@ func (l *Logger) Panic(msg string, keysAndValues ...interface{}) {
 
 // HTTPRequest logs an HTTP request with detailed information
 func (l *Logger) HTTPRequest(method, path string, status int, latency time.Duration, keysAndValues ...interface{}) {
-	// Combine standard HTTP fields with any additional fields
 	fields := make([]interface{}, 0, 8+len(keysAndValues))
 	fields = append(fields,
 		"method", method,
@@ -509,7 +494,6 @@ func (l *Logger) HTTPRequest(method, path string, status int, latency time.Durat
 	)
 	fields = append(fields, keysAndValues...)
 
-	// Color code based on status
 	if status >= 500 {
 		l.SugaredLogger.Errorw("HTTP Request", fields...)
 	} else if status >= 400 {
@@ -579,35 +563,13 @@ func (l *Logger) GetZapLogger() *zap.Logger {
 	return l.SugaredLogger.Desugar()
 }
 
-// Debugf logs a formatted debug message
-func (l *Logger) Debugf(format string, args ...interface{}) {
-	l.SugaredLogger.Debugf(format, args...)
-}
-
-// Infof logs a formatted info message
-func (l *Logger) Infof(format string, args ...interface{}) {
-	l.SugaredLogger.Infof(format, args...)
-}
-
-// Warnf logs a formatted warning message
-func (l *Logger) Warnf(format string, args ...interface{}) {
-	l.SugaredLogger.Warnf(format, args...)
-}
-
-// Errorf logs a formatted error message
-func (l *Logger) Errorf(format string, args ...interface{}) {
-	l.SugaredLogger.Errorf(format, args...)
-}
-
-// Fatalf logs a formatted fatal message and then exits
-func (l *Logger) Fatalf(format string, args ...interface{}) {
-	l.SugaredLogger.Fatalf(format, args...)
-}
-
-// Panicf logs a formatted panic message and then panics
-func (l *Logger) Panicf(format string, args ...interface{}) {
-	l.SugaredLogger.Panicf(format, args...)
-}
+// Format-style logging methods
+func (l *Logger) Debugf(format string, args ...interface{}) { l.SugaredLogger.Debugf(format, args...) }
+func (l *Logger) Infof(format string, args ...interface{})  { l.SugaredLogger.Infof(format, args...) }
+func (l *Logger) Warnf(format string, args ...interface{})  { l.SugaredLogger.Warnf(format, args...) }
+func (l *Logger) Errorf(format string, args ...interface{}) { l.SugaredLogger.Errorf(format, args...) }
+func (l *Logger) Fatalf(format string, args ...interface{}) { l.SugaredLogger.Fatalf(format, args...) }
+func (l *Logger) Panicf(format string, args ...interface{}) { l.SugaredLogger.Panicf(format, args...) }
 
 // Sync flushes any buffered log entries
 func (l *Logger) Sync() error {
@@ -639,7 +601,6 @@ func NewFileLogger(filePath string, level LogLevel) (*Logger, error) {
 	config.Output = filePath
 	config.Level = level
 
-	// Create directory if needed
 	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create log directory %s: %v", dir, err)
@@ -649,10 +610,7 @@ func NewFileLogger(filePath string, level LogLevel) (*Logger, error) {
 }
 
 // NewRollingFileLogger creates a logger with file rotation capabilities
-// This is a placeholder - actual implementation would require a file rotation package
 func NewRollingFileLogger(filePath string, level LogLevel) (*Logger, error) {
-	// Note: This would typically use a rolling file implementation
-	// For now, we just create a regular file logger with a note
 	logger, err := NewFileLogger(filePath, level)
 	if err != nil {
 		return nil, err
@@ -673,33 +631,6 @@ func (l *Logger) ShutdownSignalHandler() {
 		_ = l.Sync()
 		os.Exit(0)
 	}()
-}
-
-// LogMiddleware returns an HTTP middleware that logs requests
-func (l *Logger) LogMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-
-		// Create a wrapped response writer to capture status code
-		wrapper := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-
-		// Process request
-		next.ServeHTTP(wrapper, r)
-
-		// Calculate duration
-		duration := time.Since(start)
-
-		// Log the request
-		l.HTTPRequest(
-			r.Method,
-			r.URL.Path,
-			wrapper.statusCode,
-			duration,
-			"ip", getClientIP(r),
-			"user_agent", r.UserAgent(),
-			"referer", r.Referer(),
-		)
-	})
 }
 
 // responseWriter is a wrapper around http.ResponseWriter that captures the status code
@@ -727,27 +658,43 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 
 // getClientIP extracts the client IP from a request
 func getClientIP(r *http.Request) string {
-	// Check for X-Forwarded-For header first
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		ips := strings.Split(xff, ",")
-		// Take the leftmost entry if there are multiple IPs
 		ip := strings.TrimSpace(ips[0])
 		if ip != "" {
 			return ip
 		}
 	}
 
-	// Check for X-Real-IP header
 	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
 		return xrip
 	}
 
-	// Fall back to RemoteAddr
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return ip
+}
+
+// LogMiddleware returns an HTTP middleware that logs requests
+func (l *Logger) LogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		wrapper := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(wrapper, r)
+		duration := time.Since(start)
+
+		l.HTTPRequest(
+			r.Method,
+			r.URL.Path,
+			wrapper.statusCode,
+			duration,
+			"ip", getClientIP(r),
+			"user_agent", r.UserAgent(),
+			"referer", r.Referer(),
+		)
+	})
 }
 
 // BatchLogger provides batch logging capabilities
@@ -773,9 +720,7 @@ func NewBatchLogger(logger *Logger, maxSize int, flushInterval time.Duration) *B
 		cancel:    cancel,
 	}
 
-	// Start background flusher
 	go bl.periodicFlush()
-
 	return bl
 }
 
@@ -787,7 +732,6 @@ func (bl *BatchLogger) Add(level LogLevel, msg string, fields map[string]interfa
 		"timestamp": time.Now(),
 	}
 
-	// Add fields
 	for k, v := range fields {
 		entry[k] = v
 	}
@@ -795,7 +739,6 @@ func (bl *BatchLogger) Add(level LogLevel, msg string, fields map[string]interfa
 	bl.bufferMu.Lock()
 	bl.buffer = append(bl.buffer, entry)
 
-	// Flush if buffer reaches max size
 	if len(bl.buffer) >= bl.maxSize {
 		bl.flushLocked()
 	}
@@ -824,22 +767,18 @@ func (bl *BatchLogger) flushLocked() {
 		return
 	}
 
-	// Log each entry
 	for _, entry := range bl.buffer {
 		level := entry["level"].(LogLevel)
 		msg := entry["message"].(string)
 
-		// Remove level and message from fields
 		delete(entry, "level")
 		delete(entry, "message")
 
-		// Convert to key-value pairs
 		kvs := make([]interface{}, 0, len(entry)*2)
 		for k, v := range entry {
 			kvs = append(kvs, k, v)
 		}
 
-		// Log at appropriate level
 		switch level {
 		case DebugLevel:
 			bl.Debug(msg, kvs...)
@@ -850,15 +789,12 @@ func (bl *BatchLogger) flushLocked() {
 		case ErrorLevel:
 			bl.Error(msg, kvs...)
 		case FatalLevel:
-			// Don't actually call Fatal to avoid program termination
 			bl.Error("FATAL: "+msg, kvs...)
 		case PanicLevel:
-			// Don't actually call Panic to avoid panic
 			bl.Error("PANIC: "+msg, kvs...)
 		}
 	}
 
-	// Clear buffer
 	bl.buffer = bl.buffer[:0]
 }
 
